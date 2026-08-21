@@ -24,18 +24,57 @@ CodexMeter C6 是为 Waveshare ESP32-C6-Touch-AMOLED-1.43（466×466、CO5300）
 
 依赖许可证和上游链接见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
-## 数据链路
+## 数据流转过程
 
-```text
-Codex 本地状态
-  -> 主机额度导出脚本
-  -> tools/publish-codex-usage-c6-mqtt.ps1
-  -> MQTT retained 主题
-  -> ESP32-C6
-  -> CO5300 AMOLED
+```mermaid
+flowchart TD
+    subgraph HOST["Windows 主机"]
+        direction TB
+        A["Codex 本地额度状态"]
+        B["额度导出脚本<br/>-DryRun"]
+        C["publish-codex-usage-c6-mqtt.ps1<br/>筛选 windowMins = 10080"]
+        D["紧凑 MQTT v1 JSON<br/>仅保留显示字段"]
+        E["write_snapshot.py<br/>codex / exporter / manual"]
+        F["紧凑串口 v1 JSON<br/>ASCII + 换行"]
+        M["手工测试参数"]
+
+        A --> B --> C --> D
+        A -.->|Codex 数据源| E
+        B -.->|exporter 数据源| E
+        M -.->|manual 数据源| E
+        E --> F
+    end
+
+    subgraph BROKER["MQTT broker"]
+        G[("retained 主题<br/>codex/usage/c6/state")]
+    end
+
+    subgraph DEVICE["ESP32-C6"]
+        direction TB
+        H["Wi-Fi 连接<br/>MQTT 订阅与自动重连"]
+        I["mqttHandlePublish()"]
+        J["readSerialSnapshot()<br/>processLine()"]
+        K["容量与格式边界检查"]
+        L["parseSnapshot()<br/>校验 v = 1 与 preferred.primary"]
+        N["currentSnapshot<br/>仅保存在 RAM"]
+        O["renderSnapshot()<br/>抗锯齿额度圆环"]
+
+        H --> I --> K
+        J --> K --> L --> N --> O
+    end
+
+    P["CO5300 AMOLED<br/>剩余额度 / 重置时间 / 套餐 / 模型"]
+
+    D -->|PUBLISH retain| G
+    G -->|SUBSCRIBE retained/live| H
+    F -->|USB CDC COM 端口| J
+    O --> P
 ```
 
-设备只接受版本为 `v = 1` 的紧凑快照，并以 `windowMins = 10080` 识别七天窗口。不要把包含历史桶和大量字段的完整主机状态直接发送给设备。
+- MQTT 是日常主链路：主机端先筛选 `windowMins = 10080` 的七天额度，再发布 retained 快照；设备重启后可从 broker 恢复最近一次数据。
+- USB CDC 是诊断旁路：`write_snapshot.py` 可从 Codex app-server、外部导出脚本或手工参数生成相同 v1 结构，并复用设备端解析与渲染流程。
+- `parseSnapshot()` 负责校验 `v = 1` 和 `preferred.primary`；有效数据写入 RAM 中的 `currentSnapshot`，不会把 Codex 登录态写入设备。
+- 不要把包含历史桶和大量字段的完整主机状态直接发送给设备；压缩、七天窗口选择和隐私裁剪都属于主机端边界。
 
 ## 快速开始
 
