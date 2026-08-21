@@ -1,0 +1,22 @@
+# 本地凭据
+src/secrets.h
+.env
+.env.*
+!.env.example
+
+# Arduino / PlatformIO 构建产物
+.arduino-build*/
+.pio/
+build/
+
+# Python 缓存与虚拟环境
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 编辑器与系统文件
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
