@@ -1,5 +1,10 @@
 # 本地凭据
 src/secrets.h
+src/ota.local.h
+.local/
+*.bin
+*.elf
+*.map
 .env
 .env.*
 !.env.example

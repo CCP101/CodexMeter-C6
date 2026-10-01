@@ -1,6 +1,8 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <WiFi.h>
+#include <ArduinoOTA.h>
+#include <esp_ota_ops.h>
 #include <math.h>
 
 #include "Arduino_GFX_Library.h"
@@ -31,7 +33,7 @@ constexpr uint32_t kMqttRetryIntervalMs = 5UL * 1000UL;
 constexpr uint32_t kMqttPacketTimeoutMs = 2000UL;
 constexpr uint16_t kMqttKeepAliveSeconds = 60;
 constexpr uint32_t kFreshnessGraceSeconds = 5UL * 60UL;
-constexpr uint32_t kMinimumRenderIntervalMs = 60UL * 1000UL;
+constexpr uint32_t kMinimumRenderIntervalMs = 5UL * 60UL * 1000UL;
 constexpr int16_t kRingCenterX = LCD_WIDTH / 2;
 constexpr int16_t kRingCenterY = 208;
 constexpr int16_t kRingOuterRadius = 132;
@@ -46,6 +48,14 @@ constexpr int16_t kRingBitmapSize = 2 * (kRingOuterRadius + kRingBitmapMargin) +
 #else
 #error "Missing src/secrets.h; copy src/secrets.example.h and fill in local values."
 #endif
+
+#if __has_include("ota.local.h")
+#include "ota.local.h"
+#else
+constexpr char kOtaPasswordHash[] = "";
+#endif
+constexpr char kOtaHostname[] = "codexmeter-c6";
+constexpr uint16_t kOtaPort = 3232;
 
 enum SnapshotLinkState : uint8_t {
   kLinkLive = 0,
@@ -63,7 +73,7 @@ struct UsageSnapshot {
   long capturedAt = -1;
   long nextPollIn = -1;
   SnapshotLinkState linkState = kLinkLive;
-  char planLabel[32] = "CODEX";
+  char planLabel[32] = "UNKNOWN";
   char modelLabel[32] = "MODEL UNKNOWN";
   char source[20] = "MQTT EXPORTER";
 };
@@ -97,6 +107,9 @@ uint16_t mqttPacketId = 0;
 bool wifiStarted = false;
 bool wifiReported = false;
 bool mqttReported = false;
+bool otaStarted = false;
+bool otaInProgress = false;
+int lastOtaProgress = -1;
 
 void reportDiagnostics();
 void renderSnapshot();
@@ -239,10 +252,13 @@ bool parseSnapshot(const char *json, UsageSnapshot *snapshot)
     snprintf(parsed.source, sizeof(parsed.source), "%s", source);
   }
 
-  char planLabel[sizeof(parsed.planLabel)] = "CODEX";
-  if (jsonString(json, "\"planLabel\"", planLabel, sizeof(planLabel)) ||
-      jsonString(json, "\"plan\"", planLabel, sizeof(planLabel))) {
+  char planLabel[sizeof(parsed.planLabel)] = "UNKNOWN";
+  if ((jsonString(json, "\"planLabel\"", planLabel, sizeof(planLabel)) && planLabel[0]) ||
+      (jsonString(json, "\"plan\"", planLabel, sizeof(planLabel)) && planLabel[0])) {
     snprintf(parsed.planLabel, sizeof(parsed.planLabel), "%s", planLabel);
+  }
+  if (strcasecmp(parsed.planLabel, "codex") == 0) {
+    snprintf(parsed.planLabel, sizeof(parsed.planLabel), "UNKNOWN");
   }
 
   char modelLabel[sizeof(parsed.modelLabel)] = "MODEL UNKNOWN";
@@ -442,17 +458,14 @@ void applyMqttSnapshot(const char *payload)
     return;
   }
 
-  const bool firstSnapshot = !currentSnapshot.valid;
   currentSnapshot = parsed;
-  if (firstSnapshot || millis() - lastRenderAt >= kMinimumRenderIntervalMs) {
-    renderSnapshot();
-  }
+  renderSnapshot();
   USBSerial.print("CODEX_MQTT_SNAPSHOT remaining=");
   USBSerial.print(currentSnapshot.remaining);
   USBSerial.print(" windowMins=");
   USBSerial.print(currentSnapshot.windowMins);
-  USBSerial.print(" source=");
-  USBSerial.println(kMqttTopic);
+  USBSerial.print(" plan=");
+  USBSerial.println(currentSnapshot.planLabel);
 }
 
 bool mqttHandlePublish(uint8_t header, uint32_t remaining)
@@ -559,7 +572,7 @@ bool mqttConnectAndSubscribe()
 
   mqttReported = true;
   nextMqttRefreshAt = millis() + kMqttRefreshIntervalMs;
-  USBSerial.println("CODEX_MQTT_CONNECTED topic=home/codex/usage/c6/state");
+  USBSerial.println("CODEX_MQTT_CONNECTED");
   return true;
 }
 
@@ -611,6 +624,48 @@ void startWiFi()
   wifiStarted = true;
   nextWifiAttemptAt = millis() + kWifiRetryIntervalMs;
   USBSerial.println("CODEX_WIFI_CONNECTING ssid_configured=1");
+}
+
+void serviceOta()
+{
+  if (strlen(kOtaPasswordHash) != 64) return;  // Never start unauthenticated OTA.
+  if (WiFi.status() != WL_CONNECTED) {
+    if (otaStarted) ArduinoOTA.end();
+    otaStarted = false;
+    return;
+  }
+  if (!otaStarted) {
+    if (!esp_ota_get_next_update_partition(nullptr)) return;
+    ArduinoOTA.setHostname(kOtaHostname);
+    ArduinoOTA.setPort(kOtaPort);
+    ArduinoOTA.setPasswordHash(kOtaPasswordHash);
+    ArduinoOTA.onStart([]() {
+      otaInProgress = true;
+      lastOtaProgress = -1;
+      mqttClient.stop();
+      mqttReported = false;
+      USBSerial.println("CODEX_OTA_START");
+    });
+    ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+      const int percent = total ? static_cast<int>((uint64_t(progress) * 100) / total) : 0;
+      if (percent / 10 != lastOtaProgress / 10 || lastOtaProgress < 0) {
+        lastOtaProgress = percent;
+        USBSerial.printf("CODEX_OTA_PROGRESS percent=%d\n", percent);
+      }
+    });
+    ArduinoOTA.onEnd([]() {
+      USBSerial.println("CODEX_OTA_COMPLETE reboot=1");
+    });
+    ArduinoOTA.onError([](ota_error_t error) {
+      otaInProgress = false;
+      nextMqttAttemptAt = millis();
+      USBSerial.printf("CODEX_OTA_ERROR code=%u\n", static_cast<unsigned>(error));
+    });
+    ArduinoOTA.begin();
+    otaStarted = true;
+    USBSerial.printf("CODEX_OTA_READY host=%s port=%u auth=required\n", kOtaHostname, kOtaPort);
+  }
+  ArduinoOTA.handle();
 }
 
 void waitForWiFiAtBoot()
@@ -883,7 +938,7 @@ void renderWaiting()
   if (!displayReady) return;
 
   gfx->fillScreen(kBackground);
-  drawCentered("CodeX PRO", 12, 2, kText);
+  drawCentered("CodeX / PLAN PENDING", 12, 2, kText);
   drawCentered("MODEL PENDING", 38, 1, kMuted);
   drawCentered("WAITING", 58, 1, kBlue);
   drawUsageRing(0, kBlue);
@@ -912,6 +967,7 @@ void renderSnapshot()
   char syncText[48];
   char healthText[20];
   char modelText[sizeof(currentSnapshot.modelLabel)];
+  char planText[sizeof(currentSnapshot.planLabel) + 8];
   snprintf(percentage, sizeof(percentage), "%d%%", currentSnapshot.remaining);
   formatReset(resetSeconds, resetText, sizeof(resetText));
   formatWindow(currentSnapshot.windowMins, windowText, sizeof(windowText));
@@ -919,9 +975,10 @@ void renderSnapshot()
   formatNextSync(currentSnapshot, ageSeconds, syncText, sizeof(syncText));
   snprintf(healthText, sizeof(healthText), "%s", quotaHealth(currentSnapshot.remaining));
   snprintf(modelText, sizeof(modelText), "%s", currentSnapshot.modelLabel);
+  snprintf(planText, sizeof(planText), "CodeX %s", currentSnapshot.planLabel);
 
   gfx->fillScreen(kBackground);
-  drawCentered("CodeX PRO", 12, 2, kText);
+  drawCentered(planText, 12, strlen(planText) > 28 ? 1 : 2, kText);
   drawCentered(modelText, 36, 2, kMuted);
   drawCentered(linkLabel(currentSnapshot, ageSeconds), 58, 1, stateColor);
 
@@ -954,6 +1011,8 @@ void sendAck(const UsageSnapshot &snapshot)
   USBSerial.print(snapshot.windowMins);
   USBSerial.print(" nextPollIn=");
   USBSerial.print(snapshot.nextPollIn);
+  USBSerial.print(" plan=");
+  USBSerial.print(snapshot.planLabel);
   USBSerial.println();
 }
 
@@ -969,11 +1028,8 @@ void processLine()
 
   UsageSnapshot parsed;
   if (parseSnapshot(inputLine, &parsed)) {
-    const bool firstSnapshot = !currentSnapshot.valid;
     currentSnapshot = parsed;
-    if (firstSnapshot || millis() - lastRenderAt >= kMinimumRenderIntervalMs) {
-      renderSnapshot();
-    }
+    renderSnapshot();
     sendAck(currentSnapshot);
   } else {
     USBSerial.println("CODEX_NACK error=invalid_v1_snapshot");
@@ -1026,8 +1082,19 @@ void scanI2cForDiagnostics()
 void reportDiagnostics()
 {
   USBSerial.println("CODEX_DIAG_BEGIN");
+  const esp_partition_t *running = esp_ota_get_running_partition();
+  const esp_partition_t *next = esp_ota_get_next_update_partition(nullptr);
+  USBSerial.printf("CODEX_FIRMWARE build=%s_%s partition=%s\n", __DATE__, __TIME__,
+                   running ? running->label : "unknown");
+  USBSerial.printf("CODEX_OTA_STATE ready=%u configured=%u port=%u next=%s capacity=%lu\n",
+                   otaStarted, strlen(kOtaPasswordHash) == 64, kOtaPort,
+                   next ? next->label : "none", next ? static_cast<unsigned long>(next->size) : 0UL);
+  USBSerial.print("CODEX_NETWORK ip=");
+  USBSerial.println(WiFi.localIP());
+  USBSerial.printf("CODEX_PLAN valid=%u label=%s\n", currentSnapshot.valid,
+                   currentSnapshot.planLabel);
   USBSerial.println("CODEX_BOARD model=ESP32-C6-Touch-AMOLED-1.43 display=co5300 resolution=466x466");
-  USBSerial.println("CODEX_UI renderer=aa-bitmap-ring-v3 refresh_ms=60000");
+  USBSerial.println("CODEX_UI renderer=aa-bitmap-ring-v3 refresh_ms=300000");
   USBSerial.println("CODEX_I2C_CONFIG sda=18 scl=8");
   USBSerial.print("CODEX_STATE expander=");
   USBSerial.print(expanderReady ? "ready" : "failed");
@@ -1081,12 +1148,18 @@ void setup()
 
   USBSerial.println("CODEX_METER_READY v=1 transport=mqtt display=co5300 board=amoled-1.43 ui=aa-bitmap-ring-v3 refresh_s=1800");
   if (WiFi.status() == WL_CONNECTED) {
+    serviceOta();
     mqttConnectAndSubscribe();
   }
 }
 
 void loop()
 {
+  serviceOta();
+  if (otaInProgress) {
+    delay(5);
+    return;
+  }
   serviceNetwork();
   readSerialSnapshot();
 

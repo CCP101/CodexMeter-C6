@@ -11,6 +11,8 @@ CodexMeter C6 是为 Waveshare ESP32-C6-Touch-AMOLED-1.43（466×466、CO5300）
 - MQTT 断线自动重连，并定期重新订阅 retained 主题。
 - 保留 USB CDC 快照入口，便于无 MQTT 环境下诊断显示与解析逻辑。
 - 只接收显示所需字段，设备端不保存 Codex 登录态或账号凭据。
+- 标题读取 MQTT 快照的 `planLabel`（兼容 `plan`），不再写死 Plus/Pro；等待数据时显示 `PLAN PENDING`，缺失计划时显示 `UNKNOWN`。
+- 支持带密码认证的局域网 OTA，保留 USB 烧录与诊断入口。
 
 ## 硬件与软件
 
@@ -105,6 +107,31 @@ arduino-cli upload --fqbn $fqbn --port COM3 --input-dir .\.arduino-build
 
 `COM3` 只是示例；请以设备管理器或 `arduino-cli board list` 当前识别到的端口为准。
 
+### 4. 启用并使用 OTA（Windows / PowerShell 7）
+
+首次启用需要 USB 烧录一次。使用 Arduino-ESP32 **3.3.11** 自带的 ArduinoOTA 与 `espota.py`；认证协议须使用配套版本。默认分区已有两个 `0x140000` 字节应用槽，不修改分区表。
+
+```powershell
+# 生成随机密码，仅以当前 Windows 用户的 DPAPI 加密形式保存；重复运行不会覆盖。
+pwsh -NoProfile -File .\tools\ota.ps1 -Action Initialize
+
+# 编译过程中生成临时认证哈希头文件，结束后清理；明文密码不写入源码。
+pwsh -NoProfile -File .\tools\ota.ps1 -Action Build
+arduino-cli upload --fqbn 'esp32:esp32:esp32c6:FlashSize=16M' --port COM3 --input-dir .\.arduino-build-ota
+
+# 后续更新：重新编译后通过 Wi-Fi 烧录应用镜像。
+pwsh -NoProfile -File .\tools\ota.ps1 -Action Build
+pwsh -NoProfile -File .\tools\ota.ps1 -Action Upload -Address codexmeter-c6.local
+```
+
+工具支持 `-ArduinoCli`、`-Libraries`、`-BuildPath`、`-Python`、`-Espota`、`-Firmware` 指定本机路径。只有应用 `.ino.bin` 可用于 OTA；工具拒绝错误芯片、超出分区容量、merged 和 bootloader 文件。直接运行普通 `arduino-cli compile` 不会带入 OTA 凭据，**会得到禁用 OTA 的固件**；需要 OTA 时始终使用上述 `-Action Build`。
+
+若 mDNS 不可用，向串口发送 `CODEX_DIAG`，用 `CODEX_NETWORK` 的 IP 作为 `-Address`。设备监听 UDP 3232，并回连上传主机 TCP 3233（可用 `-HostPort` 修改）；仅在可信局域网放行相应流量。上传密码不会进入命令行参数。也可在本机通过 `CODEX_C6_OTA_PASSWORD` 提供至少 16 位密码，编译与上传必须使用同一个密码。
+
+`.local/ota-password.dpapi` 只能由对应 Windows 用户解密，不应提交或公开备份。丢失该文件或更换 Windows 用户后，重新初始化凭据并通过 USB 烧录。未完成的传输不会切换启动分区；本配置**没有启用启动健康检查失败自动回滚**，新固件无法启动时用 USB 恢复。
+
+OTA 时串口输出 `CODEX_OTA_START/PROGRESS/COMPLETE`，重启后 `CODEX_DIAG` 可检查构建时间、运行分区和下一升级分区。设备启动输出 `CODEX_OTA_READY ... auth=required` 才表示 OTA 已开启。
+
 ## 发布 MQTT retained 快照
 
 `tools/publish-codex-usage-c6-mqtt.ps1` 会调用一个本机额度导出脚本的 `-DryRun` 模式，并把七天额度压缩后发布到设备主题。这个外部导出脚本不属于本仓库，必须通过环境变量或 `-ReferenceScript` 指定。
@@ -123,6 +150,8 @@ pwsh -NoProfile -File .\tools\publish-codex-usage-c6-mqtt.ps1
 ```
 
 `-DryRun` 只打印紧凑 JSON，不连接 MQTT。真实发布默认使用 retained 消息；可用 `-NoRetain` 临时关闭。
+
+日常链路保持为 **Windows 服务/计划任务 → MQTT → ESP32**：设备只在接收到推送快照后更新计划和额度，不主动读取 Codex，不新增实时轮询，也不改变主机推送频率。计划来自导出脚本实际读取的 `codex_plan_type`；Codex 接口字段见 [官方 app-server 文档](https://learn.chatgpt.com/docs/app-server)。
 
 ## USB CDC 诊断入口
 
