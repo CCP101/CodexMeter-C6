@@ -11,7 +11,7 @@ CodexMeter C6 是为 Waveshare ESP32-C6-Touch-AMOLED-1.43（466×466、CO5300）
 - MQTT 断线自动重连，并定期重新订阅 retained 主题。
 - 保留 USB CDC 快照入口，便于无 MQTT 环境下诊断显示与解析逻辑。
 - 只接收显示所需字段，设备端不保存 Codex 登录态或账号凭据。
-- 标题读取 MQTT 快照的 `planLabel`（兼容 `plan`），不再写死 Plus/Pro；等待数据时显示 `PLAN PENDING`，缺失计划时显示 `UNKNOWN`。
+- 标题读取 MQTT 快照的 `planLabel`（兼容 `plan`），将 `prolite` 显示为 `Pro5X`，明确提供的 `Pro10X` 等计划名优先保留；等待数据时显示 `PLAN PENDING`，缺失计划时显示 `UNKNOWN`。
 - 支持带密码认证的局域网 OTA，保留 USB 烧录与诊断入口。
 
 ## 硬件与软件
@@ -152,6 +152,8 @@ pwsh -NoProfile -File .\tools\publish-codex-usage-c6-mqtt.ps1
 `-DryRun` 只打印紧凑 JSON，不连接 MQTT。真实发布默认使用 retained 消息；可用 `-NoRetain` 临时关闭。
 
 日常链路保持为 **Windows 服务/计划任务 → MQTT → ESP32**：设备只在接收到推送快照后更新计划和额度，不主动读取 Codex，不新增实时轮询，也不改变主机推送频率。计划来自导出脚本实际读取的 `codex_plan_type`；Codex 接口字段见 [官方 app-server 文档](https://learn.chatgpt.com/docs/app-server)。
+
+计划名称只在显示层转换，原始码值仍可通过 `CODEX_DIAG` 的 `label` 核对，`display` 是屏幕显示名。`prolite → Pro5X`；明确的 `PRO5X/PRO10X/PRO20X/PRO50X` 转成对应可读名称，`PLUS/FREE/BUSINESS` 等显示为 `Plus/Free/Business`。裸 `pro` 只显示 `Pro`：该码值未包含倍率，不能自动推断 10X/20X。未知码值保留原文，后续实际接口若提供更完整的 `planLabel`，优先使用它。
 
 ## USB CDC 诊断入口
 

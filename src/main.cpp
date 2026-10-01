@@ -933,6 +933,30 @@ void formatWindow(int minutes, char *target, size_t targetSize)
   }
 }
 
+const char *displayPlanName(const char *plan)
+{
+  // Translate a reported code; never infer a usage multiplier from bare "pro".
+  // Explicit planLabel names still take precedence over plan in parseSnapshot().
+  struct PlanName { const char *code; const char *name; };
+  static const PlanName names[] = {
+      {"prolite", "Pro5X"}, {"pro5x", "Pro5X"},
+      {"pro10x", "Pro10X"}, {"pro20x", "Pro20X"},
+      {"pro50x", "Pro50X"}, {"pro", "Pro"},
+      {"plus", "Plus"}, {"free", "Free"}, {"go", "Go"},
+      {"team", "Team"}, {"business", "Business"},
+      {"self_serve_business_prolite", "Business"},
+      {"self_serve_business_usage_based", "Business"},
+      {"ent26", "Enterprise"}, {"enterprise", "Enterprise"},
+      {"enterprise_cbp_automation", "Enterprise"},
+      {"enterprise_cbp_usage_based", "Enterprise"},
+      {"edu", "Edu"}, {"unknown", "UNKNOWN"},
+  };
+  for (const auto &entry : names) {
+    if (strcasecmp(plan, entry.code) == 0) return entry.name;
+  }
+  return plan;  // Preserve a future plan's supplied name instead of guessing.
+}
+
 void renderWaiting()
 {
   if (!displayReady) return;
@@ -975,7 +999,7 @@ void renderSnapshot()
   formatNextSync(currentSnapshot, ageSeconds, syncText, sizeof(syncText));
   snprintf(healthText, sizeof(healthText), "%s", quotaHealth(currentSnapshot.remaining));
   snprintf(modelText, sizeof(modelText), "%s", currentSnapshot.modelLabel);
-  snprintf(planText, sizeof(planText), "CodeX %s", currentSnapshot.planLabel);
+  snprintf(planText, sizeof(planText), "CodeX %s", displayPlanName(currentSnapshot.planLabel));
 
   gfx->fillScreen(kBackground);
   drawCentered(planText, 12, strlen(planText) > 28 ? 1 : 2, kText);
@@ -1013,6 +1037,8 @@ void sendAck(const UsageSnapshot &snapshot)
   USBSerial.print(snapshot.nextPollIn);
   USBSerial.print(" plan=");
   USBSerial.print(snapshot.planLabel);
+  USBSerial.print(" display=");
+  USBSerial.print(displayPlanName(snapshot.planLabel));
   USBSerial.println();
 }
 
@@ -1091,8 +1117,8 @@ void reportDiagnostics()
                    next ? next->label : "none", next ? static_cast<unsigned long>(next->size) : 0UL);
   USBSerial.print("CODEX_NETWORK ip=");
   USBSerial.println(WiFi.localIP());
-  USBSerial.printf("CODEX_PLAN valid=%u label=%s\n", currentSnapshot.valid,
-                   currentSnapshot.planLabel);
+  USBSerial.printf("CODEX_PLAN valid=%u label=%s display=%s\n", currentSnapshot.valid,
+                   currentSnapshot.planLabel, displayPlanName(currentSnapshot.planLabel));
   USBSerial.println("CODEX_BOARD model=ESP32-C6-Touch-AMOLED-1.43 display=co5300 resolution=466x466");
   USBSerial.println("CODEX_UI renderer=aa-bitmap-ring-v3 refresh_ms=300000");
   USBSerial.println("CODEX_I2C_CONFIG sda=18 scl=8");
